@@ -1,199 +1,733 @@
 package ij.plugin;
-import java.awt.*;
-import java.io.*;
-import java.util.zip.GZIPInputStream;
-import ij.*;
-import ij.io.*;
-import ij.process.*;
-import ij.measure.*;
-import ij.util.Tools;
 
-/** Opens and displays FITS images. The FITS format is 
-	described at "http://fits.gsfc.nasa.gov/fits_standard.html".
-*/
-public class FITS_Reader extends ImagePlus implements PlugIn {
+import ij.IJ;
+import ij.ImagePlus;
+import ij.ImageStack;
+import ij.gui.Plot;
+import ij.io.FileInfo;
+import ij.io.FileOpener;
+import ij.io.OpenDialog;
+import ij.measure.Calibration;
+import ij.process.FloatProcessor;
+import ij.process.ImageProcessor;
+import nom.tam.fits.BasicHDU;
+import nom.tam.fits.Data;
+import nom.tam.fits.Fits;
+import nom.tam.fits.FitsException;
+import nom.tam.fits.Header;
+import nom.tam.fits.ImageHDU;
+import nom.tam.image.compression.hdu.CompressedImageHDU;
+import skyview.data.CoordinateFormatter;
+import skyview.geometry.WCS;
 
-	public void run(String arg) {
-		OpenDialog od = new OpenDialog("Open FITS...", arg);
-		String directory = od.getDirectory();
-		String fileName = od.getFileName();
-		if (fileName==null)
-			return;
-		IJ.showStatus("Opening: " + directory + fileName);
-		FitsDecoder fd = new FitsDecoder(directory, fileName);
-		FileInfo fi = null;
-		try {fi = fd.getInfo();}
-		catch (IOException e) {}
-        
-		if (fi!=null && fi.width>0 && fi.height>0 && fi.offset>0) {
-			FileOpener fo = new FileOpener(fi);
-			ImagePlus imp = fo.open(false);
-			if(fi.nImages==1) {
-			  ImageProcessor ip = imp.getProcessor();			   
-			  ip.flipVertical(); // origin is at bottom left corner
-			  setProcessor(fileName, ip);
-			} else {
-			  ImageStack stack = imp.getStack(); // origin is at bottom left corner				 
-			  for(int i=1; i<=stack.getSize(); i++)
-				  stack.getProcessor(i).flipVertical();
-			  setStack(fileName, stack);
-			}
-			Calibration cal = imp.getCalibration();
-            
-            if (fi.fileType==FileInfo.GRAY8 && (fd.bscale!=1.0 || fd.bzero!=0))
-                {  
-                cal.setFunction(Calibration.STRAIGHT_LINE, new double[] {fd.bzero, fd.bscale}, "Gray Value");
-                }
-            else if (fi.fileType==FileInfo.GRAY16_SIGNED && fd.bscale==1.0 && fd.bzero==32768.0)
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static nom.tam.fits.header.InstrumentDescription.FILTER;
+import static nom.tam.fits.header.ObservationDescription.DEC;
+import static nom.tam.fits.header.ObservationDescription.RA;
+import static nom.tam.fits.header.ObservationDurationDescription.EXPTIME;
+import static nom.tam.fits.header.Standard.NAXIS;
+
+public class FITS extends ImagePlus implements PlugIn
+{
+    private WCS wcs;
+    private FileInfo fileInfo;
+    private ImagePlus imagePlus;
+    private FitsDecoder fitsDecoder;
+    private String fileName;
+    private Fits fits;
+    private int wi;
+    private int he;
+    private int de;
+    private String imageDescription;
+
+    /**
+     * Main processing method for the FITS object
+     *
+     * @param arg Description of the Parameter
+     */
+    public void run(String path)
+    {
+        wcs = null;
+        imagePlus = null;
+
+        BasicHDU[] hdu = new BasicHDU[0];
+        try
+        {
+            hdu = getHDU(path);
+        }
+        catch (FitsException e)
+        {
+            IJ.error("Unable to open FITS file " + path + ": " + e.getMessage());
+            return;
+        }
+        int imageIndex = 0;
+
+        Data imgData;
+        BasicHDU displayHdu;
+        if (hdu[imageIndex].getHeader().getIntValue(NAXIS) == 0)
+        {
+            imageIndex = 1;
+            try
+            {
+                displayHdu = getCompressedImageData((CompressedImageHDU) hdu[imageIndex]);
+            }
+            catch (FitsException e)
+            {
+                IJ.error("Failed to uncompress image: " + e.getMessage());
+                return;
+            }
+            imgData = displayHdu.getData();
+            wi = hdu[imageIndex].getHeader().getIntValue("ZNAXIS1");
+            he = hdu[imageIndex].getHeader().getIntValue("ZNAXIS2");
+            de = 1;
+        }
+        else
+        {
+            displayHdu = hdu[imageIndex];
+            imgData = getImageData(hdu[imageIndex]);
+            try
+            {
+                fixDimensions(hdu[imageIndex], hdu[imageIndex].getAxes().length);
+            }
+            catch (FitsException e)
+            {
+                IJ.error("Failed to set image dimensions: "+ e.getMessage());
+            }
+        }
+
+        buildImageDescriptionFromHeader(displayHdu);
+
+        if ((wi < 0) || (he < 0))
+        {
+            IJ.error("This does not appear to be a FITS file. " + wi + " " + he);
+            return;
+        }
+        if (de == 1)
+        {
+            try
+            {
+                displaySingleImage(displayHdu, imgData);
+            }
+            catch (FitsException e)
+            {
+                IJ.error("Failed to display single image: " + e.getMessage());
+                return;
+            }
+        }
+        else
+        {
+            displayStackedImage();
+        }
+
+        if (fitsDecoder != null)
+        {
+            setProperty("Info", imageDescription + fitsDecoder.getHeaderInfo());
+        }
+        if (fileInfo != null)
+        {
+            setFileInfo(fileInfo);
+        }
+        show();
+
+        IJ.showStatus("");
+        try
+        {
+            writeTemporaryFITSFile(hdu[imageIndex]);
+        }
+        catch (FileNotFoundException e)
+        {
+            IJ.error("File not found: " + e.getMessage() );
+        }
+        catch (FitsException e)
+        {
+            IJ.error("This does not appear to be a FITS file: " + e.getMessage());
+        }
+    }
+
+    private ImageHDU getCompressedImageData(CompressedImageHDU hdu) throws FitsException
+    {
+        return hdu.asImageHDU();
+    }
+
+    private void displayStackedImage()
+    {
+        ImageStack stack = imagePlus.getStack();
+        for (int i = 1; i <= stack.getSize(); i++)
+        {
+            stack.getProcessor(i).flipVertical();
+        }
+        setStack(fileName, stack);
+    }
+
+    private void displaySingleImage(BasicHDU hdu, Data imgData)
+            throws FitsException
+    {
+        ImageProcessor imageProcessor = null;
+        int dim = hdu.getAxes().length;
+
+        if (hdu.getHeader().getIntValue(NAXIS) == 2)
+        {
+            imageProcessor = process2DimensionalImage(hdu, imgData);
+        }
+        else if (hdu.getHeader().getIntValue(NAXIS) == 3
+                && hdu.getAxes()[dim - 2] == 1 && hdu.getAxes()[dim - 3] == 1)
+        {
+            imageProcessor = process3DimensionalImage(hdu, imgData);
+        }
+
+        if (imageProcessor == null)
+        {
+            imageProcessor = imagePlus.getProcessor();
+            imageProcessor.flipVertical();
+            setProcessor(fileName, imageProcessor);
+        }
+    }
+
+    private void writeTemporaryFITSFile(BasicHDU hdu) throws FileNotFoundException, FitsException
+    {
+        File file = new File(IJ.getDirectory("home") + ".tmp.fits");
+        FileOutputStream fis = new FileOutputStream(file);
+        DataOutputStream dos = new DataOutputStream(fis);
+        fits.write(dos);
+        try
+        {
+            wcs = new WCS(hdu.getHeader());
+        }
+        catch (Exception e)
+        {
+            Logger.getLogger(FITS.class.getName()).log(Level.SEVERE, null, e);
+        }
+        finally
+        {
+            try
+            {
+                fis.close();
+            }
+            catch (IOException ex)
+            {
+                Logger.getLogger(FITS.class.getName()).log(Level.SEVERE, null, ex);
+            }
+        }
+    }
+
+    private ImageProcessor process3DimensionalImage(BasicHDU hdu, Data imgData)
+            throws FitsException
+    {
+        ImageProcessor ip;
+        short[][][] itab = (short[][][]) imgData.getKernel();
+        float[] xValues = new float[wi];
+        float[] yValues = new float[wi];
+
+        for (int y = 0; y < wi; y++)
+        {
+            yValues[y] = (float) hdu.getBZero()
+                    + (float) hdu.getBScale() * itab[0][0][y];
+        }
+
+        String unitY;
+        unitY = "IntensityRS ";
+        String unitX;
+        unitX = "FrequencyRS ";
+        float CRVAL1 = 0;
+        float CRPIX1 = 0;
+        float CDELT1 = 0;
+        if (hdu.getHeader().getStringValue("CRVAL1") != null)
+        {
+            CRVAL1 = Float
+                    .parseFloat(hdu.getHeader().getStringValue("CRVAL1"));
+        }
+        if (hdu.getHeader().getStringValue("CRPIX1") != null)
+        {
+            CRPIX1 = Float
+                    .parseFloat(hdu.getHeader().getStringValue("CRPIX1"));
+        }
+        if (hdu.getHeader().getStringValue("CDELT1") != null)
+        {
+            CDELT1 = Float
+                    .parseFloat(hdu.getHeader().getStringValue("CDELT1"));
+        }
+        for (int x = 0; x < wi; x++)
+        {
+            xValues[x] = CRVAL1 + (x - CRPIX1) * CDELT1;
+        }
+
+        int div = 1;
+        if (CRVAL1 > 2000000000)
+        {
+            div = 1000000000;
+            unitX += "(Ghz)";
+        }
+        else if (CRVAL1 > 1000000000)
+        {
+            div = 1000000;
+            unitX += "(Mhz)";
+        }
+        else if (CRVAL1 > 1000000)
+        {
+            div = 1000;
+            unitX += "(Khz)";
+        }
+        else
+        {
+            unitX += "(Hz)";
+        }
+
+        for (int x = 0; x < wi; x++)
+        {
+            xValues[x] = xValues[x] / div;
+        }
+
+        Plot P = new Plot(
+                "PlotWinTitle" + " " + fileName,
+                "X: " + unitX, "Y: " + unitY, xValues, yValues);
+        P.draw();
+
+        FloatProcessor imgtmp;
+        imgtmp = new FloatProcessor(wi, he);
+        imgtmp.setPixels(yValues);
+        imgtmp.resetMinAndMax();
+
+        if (he == 1)
+        {
+            imgtmp = (FloatProcessor) imgtmp.resize(wi, 100);
+        }
+        if (wi == 1)
+        {
+            imgtmp = (FloatProcessor) imgtmp.resize(100, he);
+        }
+
+        ip = imgtmp;
+
+        ip.flipVertical();
+        setProcessor(fileName, ip);
+        return ip;
+    }
+
+    private ImageProcessor process2DimensionalImage(BasicHDU hdu, Data imgData)
+            throws FitsException
+    {
+        ImageProcessor ip;//Profiler p = new Profiler();
+        ///////////////////////////// 16 BITS ///////////////////////
+        if (hdu.getBitPix() == 16)
+        {
+            short[][] itab = (short[][]) imgData.getKernel();
+            int idx = 0;
+            float[] imgtab;
+            FloatProcessor imgtmp;
+            imgtmp = new FloatProcessor(wi, he);
+            imgtab = new float[wi * he];
+            for (int y = 0; y < he; y++)
+            {
+                for (int x = 0; x < wi; x++)
                 {
-				cal.setFunction(Calibration.NONE, null, "Gray Value");
+                    imgtab[idx] = (float) hdu.getBZero()
+                            + (float) hdu.getBScale() * (float) itab[y][x];
+                    idx++;
                 }
-            else if (fi.fileType==FileInfo.GRAY16_SIGNED && fd.bscale!=0.0) // && (fd.bscale!=1.0 || fd.bzero!=0.0))
+            }
+            imgtmp.setPixels(imgtab);
+            imgtmp.resetMinAndMax();
+
+            if (he == 1)
+            {
+                imgtmp = (FloatProcessor) imgtmp.resize(wi, 100);
+            }
+            if (wi == 1)
+            {
+                imgtmp = (FloatProcessor) imgtmp.resize(100, he);
+            }
+            ip = imgtmp;
+            ip.flipVertical();
+            this.setProcessor(fileName, ip);
+
+        } // 8 bits
+        else if (hdu.getBitPix() == 8)
+        {
+            byte[][] itab = (byte[][]) imgData.getKernel();
+            int idx = 0;
+            float[] imgtab;
+            FloatProcessor imgtmp;
+            imgtmp = new FloatProcessor(wi, he);
+            imgtab = new float[wi * he];
+            for (int y = 0; y < he; y++)
+            {
+                for (int x = 0; x < wi; x++)
                 {
-                cal.setFunction(Calibration.STRAIGHT_LINE, new double[] {fd.bzero-32768.0*fd.bscale, fd.bscale}, "Gray Value");
+                    if (itab[x][y] < 0)
+                    {
+                        itab[x][y] += 256;
+                    }
+                    imgtab[idx] = (float) hdu.getBZero()
+                            + (float) hdu.getBScale()
+                            * (float) (itab[y][x]);
+                    idx++;
                 }
-            else if ((fi.fileType==FileInfo.GRAY32_FLOAT || fi.fileType==FileInfo.GRAY32_INT || 
-                      fi.fileType==FileInfo.GRAY64_FLOAT) && (fd.bscale!=1.0 || fd.bzero!=0.0)) 
-                {    //all of these data types are converted to 32-float by ImageReader before reaching this point
-                ImageProcessor ip = imp.getProcessor();
-                float[] pixels = (float[])ip.getPixels();
-                for (int i = 0; i < pixels.length; i++)
-                    pixels[i] = (float)(fd.bzero + fd.bscale*pixels[i]);
-                imp.setProcessor(ip);   
-                }            
-			setCalibration(cal);
-			setProperty("Info", fd.getHeaderInfo());
-			setFileInfo(fi); // needed for File->Revert
-            if (arg.equals("")) show();
-		} else
-			IJ.error("This does not appear to be a FITS file.");
-		IJ.showStatus("");
-	}
+            }
+            imgtmp.setPixels(imgtab);
+            imgtmp.resetMinAndMax();
 
-}
+            if (he == 1)
+            {
+                imgtmp = (FloatProcessor) imgtmp.resize(wi, 100);
+            }
+            if (wi == 1)
+            {
+                imgtmp = (FloatProcessor) imgtmp.resize(100, he);
+            }
+            ip = imgtmp;
+            ip.flipVertical();
+            this.setProcessor(fileName, ip);
 
-class FitsDecoder {
-	private String directory, fileName;
-	private DataInputStream f;
-	private StringBuffer info = new StringBuffer(512);
-	double bscale = 1.0, bzero = 0.0;
+        } // 16-bits
+        ///////////////// 32 BITS ///////////////////////
+        else if (hdu.getBitPix() == 32)
+        {
+            int[][] itab = (int[][]) imgData.getKernel();
+            int idx = 0;
+            float[] imgtab;
+            FloatProcessor imgtmp;
+            imgtmp = new FloatProcessor(wi, he);
+            imgtab = new float[wi * he];
+            for (int y = 0; y < he; y++)
+            {
+                for (int x = 0; x < wi; x++)
+                {
+                    imgtab[idx] = (float) hdu.getBZero()
+                            + (float) hdu.getBScale() * (float) itab[y][x];
+                    idx++;
+                }
+            }
+            imgtmp.setPixels(imgtab);
+            imgtmp.resetMinAndMax();
 
-	public FitsDecoder(String directory, String fileName) {
-		this.directory = directory;
-		this.fileName = fileName;
-	}
+            if (he == 1)
+            {
+                imgtmp = (FloatProcessor) imgtmp.resize(wi, 100);
+            }
+            if (wi == 1)
+            {
+                imgtmp = (FloatProcessor) imgtmp.resize(100, he);
+            }
 
-	FileInfo getInfo() throws IOException {
-		FileInfo fi = new FileInfo();
-		fi.fileFormat = FileInfo.FITS;
-		fi.fileName = fileName;
-		fi.directory = directory;
-		fi.width = 0;
-		fi.height = 0;
-		fi.offset = 0;
+            ip = imgtmp;
+            ip.flipVertical();
+            this.setProcessor(fileName, ip);
 
-		InputStream is = new FileInputStream(directory + fileName);
-		if (fileName.toLowerCase().endsWith(".gz")) is = new GZIPInputStream(is);
-		f = new DataInputStream(is);
-		String line = getString(80);
-		info.append(line+"\n");
-		if (!line.startsWith("SIMPLE"))
-			{f.close(); return null;}
-		int count = 1;
-		while ( true ) {
-			count++;
-			line = getString(80);
-			info.append(line+"\n");
-  
-			// Cut the key/value pair
-			int index = line.indexOf ( "=" );
+        } // 32 bits
+        /////////////// -32 BITS ?? /////////////////////////////////
+        else if (hdu.getBitPix() == -32)
+        {
+            float[][] itab = (float[][]) imgData.getKernel();
+            int idx = 0;
+            float[] imgtab;
+            FloatProcessor imgtmp;
+            imgtmp = new FloatProcessor(wi, he);
+            imgtab = new float[wi * he];
+            for (int y = 0; y < he; y++)
+            {
+                for (int x = 0; x < wi; x++)
+                {
+                    imgtab[idx] = (float) hdu.getBZero()
+                            + (float) hdu.getBScale() * itab[y][x];
+                    idx++;
+                }
+            }
+            imgtmp.setPixels(imgtab);
+            imgtmp.resetMinAndMax();
 
-			// Strip out comments
-			int commentIndex = line.indexOf ( "/", index );
-			if ( commentIndex < 0 )
-				commentIndex = line.length ();
-			
-			// Split that values
-			String key;
-			String value;
-			if ( index >= 0 ) {
-				key = line.substring ( 0, index ).trim ();
-				value = line.substring ( index + 1, commentIndex ).trim ();
-			} else {
-				key = line.trim ();
-				value = "";
-			}
-			
-			// Time to stop ?
-			if (key.equals ("END") ) break;
+            if (he == 1)
+            {
+                imgtmp = (FloatProcessor) imgtmp.resize(wi, 100);
+            }
+            if (wi == 1)
+            {
+                imgtmp = (FloatProcessor) imgtmp.resize(100, he);
+            }
 
-			// Look for interesting information			
-			if (key.equals("BITPIX")) {
-				int bitsPerPixel = Integer.parseInt ( value );
-			   if (bitsPerPixel==8)
-					fi.fileType = FileInfo.GRAY8;
-				else if (bitsPerPixel==16)
-					fi.fileType = FileInfo.GRAY16_SIGNED;
-				else if (bitsPerPixel==32)
-					fi.fileType = FileInfo.GRAY32_INT;
-				else if (bitsPerPixel==-32)
-					fi.fileType = FileInfo.GRAY32_FLOAT;
-				else if (bitsPerPixel==-64)
-					fi.fileType = FileInfo.GRAY64_FLOAT;
-				else {
-					IJ.error("BITPIX must be 8, 16, 32, -32 (float) or -64 (double).");
-					f.close();
-					return null;
-				}
-			} else if (key.equals("NAXIS1"))
-				fi.width = Integer.parseInt ( value );
-			else if (key.equals("NAXIS2"))
-				fi.height = Integer.parseInt( value );
-			else if (key.equals("NAXIS3")) //for multi-frame fits
-				fi.nImages = Integer.parseInt ( value );
-			else if (key.equals("BSCALE"))
-				bscale = Tools.parseDouble(value, 1.0);
-			else if (key.equals("BZERO"))
-				bzero = Tools.parseDouble(value, 0.0);
-//            else if (key.equals("CDELT1"))                //LET WCS TAKE CARE OF ADDING THIS INFO
-//                fi.pixelWidth = Math.abs(Tools.parseDouble(value, 1.0));
-//            else if (key.equals("CDELT2"))
-//                fi.pixelHeight = Math.abs(Tools.parseDouble(value, 1.0));
-//            else if (key.equals("CDELT3"))
-//                    fi.pixelDepth = parseDouble ( value );
-//            else if (key.equals("CTYPE1"))
-//                fi.unit = value;
+            ip = imgtmp;
+            ip.flipVertical();
+            this.setProcessor(fileName, ip);
 
-			if (count>360 && fi.width==0)
-				{f.close(); return null;}
-		}
-        if (fi.fileType==FileInfo.GRAY32_INT && bzero == 2147483648.0 && bscale == 1.0) fi.fileType = FileInfo.GRAY32_UNSIGNED;
-		f.close();
-		fi.offset = 2880+2880*(((count*80)-1)/2880);
-		return fi;
-	}
+            // special spectre optique transit
+            if ((hdu.getHeader().getStringValue("STATUS") != null) && (hdu
+                    .getHeader().getStringValue("STATUS")
+                    .equals("SPECTRUM")) && (
+                    hdu.getHeader().getIntValue(NAXIS) == 2))
+            {
+                //IJ.log("spectre optique");
+                float[] xValues = new float[wi];
+                float[] yValues = new float[wi];
+                for (int y = 0; y < wi; y++)
+                {
+                    yValues[y] = itab[0][y];
+                    if (yValues[y] < 0)
+                    {
+                        yValues[y] = 0;
+                    }
+                }
+                String unitY;
+                unitY = "IntensityRS ";
+                String unitX;
+                unitX = "WavelengthRS ";
+                float CRVAL1 = 0;
+                float CRPIX1 = 0;
+                float CDELT1 = 0;
+                if (hdu.getHeader().getStringValue("CRVAL1") != null)
+                {
+                    CRVAL1 = Float.parseFloat(
+                            hdu.getHeader().getStringValue("CRVAL1"));
+                }
+                if (hdu.getHeader().getStringValue("CRPIX1") != null)
+                {
+                    CRPIX1 = Float.parseFloat(
+                            hdu.getHeader().getStringValue("CRPIX1"));
+                }
+                if (hdu.getHeader().getStringValue("CDELT1") != null)
+                {
+                    CDELT1 = Float.parseFloat(
+                            hdu.getHeader().getStringValue("CDELT1"));
+                }
+                for (int x = 0; x < wi; x++)
+                {
+                    xValues[x] = CRVAL1 + (x - CRPIX1) * CDELT1;
+                }
 
-	String getString(int length) throws IOException {
-		byte[] b = new byte[length];
-		f.readFully(b);
-		if (IJ.debugMode)
-			IJ.log(new String(b));
-		return new String(b);
-	}
+                float odiv = 1;
+                if (CRVAL1 < 0.000001)
+                {
+                    odiv = 1000000;
+                    unitX += "(µm)";
+                }
+                else
+                {
+                    unitX += "ADU";
+                }
 
-	int getInteger(String s) {
-		s = s.substring(10, 30);
-		s = s.trim();
-		return Integer.parseInt(s);
-	}
+                for (int x = 0; x < wi; x++)
+                {
+                    xValues[x] = xValues[x] * odiv;
+                }
 
-	double parseDouble(String s) throws NumberFormatException {
-		Double d = new Double(s);
-		return d.doubleValue();
-	}
+                Plot P = new Plot(
+                        "PlotWinTitle "
+                                + fileName, "X: " + unitX, "Y: " + unitY,
+                        xValues, yValues);
+                P.draw();
+            } //// end of special optique
+        } // -32 bits
+        else
+        {
+            ip = imagePlus.getProcessor();
+        }
+        return ip;
+    }
 
-	String getHeaderInfo() {
-		return new String(info);
-	}
+    private Data getImageData(BasicHDU hdu)
+    {
+        Data imgData = null;
+        if (hdu.getData() != null)
+        {
+            imgData = hdu.getData();
+        }
+        return imgData;
+    }
+
+    private void buildImageDescriptionFromHeader(BasicHDU hdu)
+    {
+        imageDescription = "";
+        if (hdu.getObject() != null)
+        {
+            imageDescription += "OBJECT: " + hdu.getObject() + "\n";
+        }
+        if (hdu.getTelescope() != null)
+        {
+            imageDescription += "TELESCOP: " + hdu.getTelescope()
+                    + "\n";
+        }
+        if (hdu.getInstrument() != null)
+        {
+            imageDescription += "INSTRUM: " + hdu.getInstrument()
+                    + "\n";
+        }
+        if (hdu.getHeader().getStringValue(FILTER) != null)
+        {
+            imageDescription += "FILTER: " + hdu.getHeader()
+                    .getStringValue(FILTER) + "\n";
+        }
+        if (hdu.getObserver() != null)
+        {
+            imageDescription +=
+                    "OBSERVER: " + hdu.getObserver() + "\n";
+        }
+        if (hdu.getHeader().getStringValue(EXPTIME) != null)
+        {
+            imageDescription += "EXPTIME: " + hdu.getHeader()
+                    .getStringValue(EXPTIME) + "\n";
+        }
+        if (hdu.getObservationDate() != null)
+        {
+            imageDescription +=
+                    "DATE-OBS: " + hdu.getObservationDate()
+                            + "\n";
+        }
+        if (hdu.getHeader().getStringValue("UT") != null)
+        {
+            imageDescription += "UT: " + hdu.getHeader()
+                    .getStringValue("UT") + "\n";
+        }
+        if (hdu.getHeader().getStringValue("UTC") != null)
+        {
+            imageDescription += "UT: " + hdu.getHeader()
+                    .getStringValue("UTC") + "\n";
+        }
+        if (hdu.getHeader().getStringValue(RA) != null)
+        {
+            imageDescription += "RA: " + hdu.getHeader()
+                    .getStringValue(RA) + "\n";
+        }
+        if (hdu.getHeader().getStringValue(DEC) != null)
+        {
+            imageDescription += "DEC: " + hdu.getHeader()
+                    .getStringValue(DEC) + "\n";
+        }
+        imageDescription += "\n" + "\n"
+                + "*************************************************************"
+                + "\n";
+
+        setProperty("Info", imageDescription + fitsDecoder.getHeaderInfo());
+
+    }
+
+    private void fixDimensions(BasicHDU hdu, int dim) throws FitsException
+    {
+        //By oli
+        // replace  hdu.getAxes()[dim - 1] by fi.width
+        // and replace  hdu.getAxes()[dim - 2] by fi.height
+        // or it would crash if it is not defined and go to the exception case at the end
+        if ((dim < 2) && (fileInfo != null))
+        {
+            wi = fileInfo.width;
+            he = fileInfo.height;
+            de = 1;
+        }
+        else
+        {
+            wi = hdu.getAxes()[dim - 1];
+            he = hdu.getAxes()[dim - 2];
+            if (dim > 2)
+            {
+                de = hdu.getAxes()[dim - 3];
+            }
+            else
+            {
+                de = 1;
+            }
+        }
+    }
+
+    private BasicHDU[] getHDU(String path) throws FitsException
+    {
+        OpenDialog od = new OpenDialog("Open FITS...", path);
+        String directory = od.getDirectory();
+        fileName = od.getFileName();
+        if (fileName == null)
+        {
+            throw new FitsException("Null filename.");
+        }
+        IJ.showStatus("Opening: " + directory + fileName);
+        IJ.log("Opening: " + directory + fileName);
+        fitsDecoder = new FitsDecoder(directory, fileName);
+        fileInfo = null;
+        try
+        {
+            fileInfo = fitsDecoder.getInfo();
+        }
+        catch (IOException e)
+        {
+            IJ.log(e.getMessage());
+        }
+
+        fits = new Fits(directory + fileName);
+        BasicHDU[] bhdu = null;
+
+        try
+        {
+            bhdu = fits.read();
+        }
+        catch (Exception e)
+        {
+            // if nasa library does not work try classical ImageJ reading
+            FITS_Reader reader = new FITS_Reader();
+            reader.run(path);
+            if (reader.getProcessor() != null)
+            {
+                reader.show();
+            }
+        }
+        return bhdu;
+
+    }
+
+    /**
+     * Gets the locationAsString attribute of the FITS object
+     *
+     * @param x Description of the Parameter
+     * @param y Description of the Parameter
+     * @return The locationAsString value
+     */
+    public String getLocationAsString(int x, int y)
+    {
+        String s;
+        if (wcs != null)
+        {
+            double[] in = new double[2];
+            in[0] = (double) (x);
+            in[1] = getProcessor().getHeight() - y - 1.0;
+            //in[2]=0.0;
+            double[] out = wcs.inverse().transform(in);
+            double[] coord = new double[2];
+            skyview.geometry.Util.coord(out, coord);
+            CoordinateFormatter cf = new CoordinateFormatter();
+            String[] ra = cf.sexagesimal(Math.toDegrees(coord[0]) / 15.0, 8).split(" ");
+            String[] dec = cf.sexagesimal(Math.toDegrees(coord[1]), 8).split(" ");
+
+            s = "x=" + x + ",y=" + y + " (RA=" + ra[0] + "h" + ra[1] + "m" + ra[2] + "s,  DEC="
+                    + dec[0] + "° " + dec[1] + "' " + dec[2] + "\"" + ")";
+
+        }
+        else
+        {
+            s = "x=" + x + " y=" + y;
+        }
+        if (getStackSize() > 1)
+        {
+            s += " z=" + (getCurrentSlice() - 1);
+        }
+        return s;
+    }
+
+    /**
+     * Gets the string attribute of the FITS class
+     *
+     * @param length Description of the Parameter
+     * @param f      Description of the Parameter
+     * @return The string value
+     * @throws IOException Description of the Exception
+     */
+    static String getString(int length, RandomAccessFile f)
+            throws IOException
+    {
+        byte[] b = new byte[length];
+        f.read(b);
+        return new String(b);
+    }
 
 }
