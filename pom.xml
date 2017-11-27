@@ -23,16 +23,48 @@
             <scope>system</scope>
             <systemPath>${java.home}/../lib/tools.jar</systemPath>
         </dependency>
+
+        <dependency>
+            <groupId>gov.nasa.gsfc.heasarc</groupId>
+            <version>1.15.1</version>
+            <artifactId>nom-tam-fits</artifactId>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/gov.nist.math/jama -->
+        <dependency>
+            <groupId>gov.nist.math</groupId>
+            <artifactId>jama</artifactId>
+            <version>1.0.2</version>
+        </dependency>
     </dependencies>
 
     <build>
+        <finalName>ij</finalName>
         <sourceDirectory>.</sourceDirectory>
-        <resources>
-            <resource><directory>macros</directory></resource>
-            <resource><directory>images</directory></resource>
-            <resource><directory>luts</directory></resource>
-            <resource><directory>.</directory></resource>
-        </resources>
+
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>2.4.3</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <transformer
+                                        implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>ij.ImageJ</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
     </build>
 
 </project>

@@ -5,16 +5,13 @@ import ij.ImagePlus;
 import ij.ImageStack;
 import ij.gui.Plot;
 import ij.io.FileInfo;
-import ij.io.FileOpener;
 import ij.io.OpenDialog;
-import ij.measure.Calibration;
 import ij.process.FloatProcessor;
 import ij.process.ImageProcessor;
 import nom.tam.fits.BasicHDU;
 import nom.tam.fits.Data;
 import nom.tam.fits.Fits;
 import nom.tam.fits.FitsException;
-import nom.tam.fits.Header;
 import nom.tam.fits.ImageHDU;
 import nom.tam.image.compression.hdu.CompressedImageHDU;
 import skyview.data.CoordinateFormatter;
@@ -25,7 +22,6 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -35,7 +31,7 @@ import static nom.tam.fits.header.ObservationDescription.RA;
 import static nom.tam.fits.header.ObservationDurationDescription.EXPTIME;
 import static nom.tam.fits.header.Standard.NAXIS;
 
-public class FITS extends ImagePlus implements PlugIn
+public class FITS_Reader extends ImagePlus implements PlugIn
 {
     private WCS wcs;
     private FileInfo fileInfo;
@@ -49,59 +45,63 @@ public class FITS extends ImagePlus implements PlugIn
     private String imageDescription;
 
     /**
-     * Main processing method for the FITS object
+     * Main processing method for the FITS_Reader object
      *
-     * @param arg Description of the Parameter
+     * @param path path of FITS file
      */
     public void run(String path)
     {
         wcs = null;
         imagePlus = null;
 
-        BasicHDU[] hdu = new BasicHDU[0];
+        /*
+         * Extract array of HDU from FITS file using nom.tam.fits
+         * This also uses the old style FITS decoder to create a FileInfo.
+         */
+        BasicHDU[] hdus;
         try
         {
-            hdu = getHDU(path);
+            hdus = getHDU(path);
         }
         catch (FitsException e)
         {
             IJ.error("Unable to open FITS file " + path + ": " + e.getMessage());
             return;
         }
-        int imageIndex = 0;
 
-        Data imgData;
+        /*
+         * For fpacked files the image is in the second HDU. For uncompressed images
+         * it is the first HDU.
+         */
         BasicHDU displayHdu;
-        if (hdu[imageIndex].getHeader().getIntValue(NAXIS) == 0)
+        if (isCompressedFormat(hdus))
         {
-            imageIndex = 1;
+            int imageIndex = 1;
             try
             {
-                displayHdu = getCompressedImageData((CompressedImageHDU) hdu[imageIndex]);
+                displayHdu = getCompressedImageData((CompressedImageHDU) hdus[imageIndex]);
             }
             catch (FitsException e)
             {
                 IJ.error("Failed to uncompress image: " + e.getMessage());
                 return;
             }
-            imgData = displayHdu.getData();
-            wi = hdu[imageIndex].getHeader().getIntValue("ZNAXIS1");
-            he = hdu[imageIndex].getHeader().getIntValue("ZNAXIS2");
-            de = 1;
         }
         else
         {
-            displayHdu = hdu[imageIndex];
-            imgData = getImageData(hdu[imageIndex]);
+            int imageIndex = 0;
+            displayHdu = hdus[imageIndex];
             try
             {
-                fixDimensions(hdu[imageIndex], hdu[imageIndex].getAxes().length);
+                fixDimensions(displayHdu, displayHdu.getAxes().length);
             }
             catch (FitsException e)
             {
                 IJ.error("Failed to set image dimensions: "+ e.getMessage());
             }
         }
+
+        Data imgData = getImageData(displayHdu);
 
         buildImageDescriptionFromHeader(displayHdu);
 
@@ -140,7 +140,7 @@ public class FITS extends ImagePlus implements PlugIn
         IJ.showStatus("");
         try
         {
-            writeTemporaryFITSFile(hdu[imageIndex]);
+            writeTemporaryFITSFile(displayHdu);
         }
         catch (FileNotFoundException e)
         {
@@ -152,8 +152,16 @@ public class FITS extends ImagePlus implements PlugIn
         }
     }
 
+    private boolean isCompressedFormat(BasicHDU[] basicHDU)
+    {
+        return basicHDU[0].getHeader().getIntValue(NAXIS) == 0;
+    }
+
     private ImageHDU getCompressedImageData(CompressedImageHDU hdu) throws FitsException
     {
+        wi = hdu.getHeader().getIntValue("ZNAXIS1");
+        he = hdu.getHeader().getIntValue("ZNAXIS2");
+        de = 1;
         return hdu.asImageHDU();
     }
 
@@ -203,7 +211,7 @@ public class FITS extends ImagePlus implements PlugIn
         }
         catch (Exception e)
         {
-            Logger.getLogger(FITS.class.getName()).log(Level.SEVERE, null, e);
+            Logger.getLogger(FITS_Reader.class.getName()).log(Level.SEVERE, null, e);
         }
         finally
         {
@@ -213,7 +221,7 @@ public class FITS extends ImagePlus implements PlugIn
             }
             catch (IOException ex)
             {
-                Logger.getLogger(FITS.class.getName()).log(Level.SEVERE, null, ex);
+                Logger.getLogger(FITS_Reader.class.getName()).log(Level.SEVERE, null, ex);
             }
         }
     }
@@ -652,28 +660,19 @@ public class FITS extends ImagePlus implements PlugIn
         }
         catch (IOException e)
         {
-            IJ.log(e.getMessage());
+            throw new FitsException("Failed to create FITS decoder: " + e.getMessage());
         }
 
         fits = new Fits(directory + fileName);
-        BasicHDU[] bhdu = null;
 
         try
         {
-            bhdu = fits.read();
+            return fits.read();
         }
         catch (Exception e)
         {
-            // if nasa library does not work try classical ImageJ reading
-            FITS_Reader reader = new FITS_Reader();
-            reader.run(path);
-            if (reader.getProcessor() != null)
-            {
-                reader.show();
-            }
+            throw new FitsException("Failed to read FITS file using nom.tam.fits: " + e.getMessage());
         }
-        return bhdu;
-
     }
 
     /**
@@ -713,21 +712,4 @@ public class FITS extends ImagePlus implements PlugIn
         }
         return s;
     }
-
-    /**
-     * Gets the string attribute of the FITS class
-     *
-     * @param length Description of the Parameter
-     * @param f      Description of the Parameter
-     * @return The string value
-     * @throws IOException Description of the Exception
-     */
-    static String getString(int length, RandomAccessFile f)
-            throws IOException
-    {
-        byte[] b = new byte[length];
-        f.read(b);
-        return new String(b);
-    }
-
 }
